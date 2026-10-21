@@ -1,0 +1,1 @@
+EcoSync branding v3: the sidebar uses /ecosync-icon.png (cropped emblem, no text); favicon is also updated. Start from this extracted folder, not the old project folder. Run npm run dev after npm install. Refresh browser with Cmd+Shift+R to clear older cached assets.
