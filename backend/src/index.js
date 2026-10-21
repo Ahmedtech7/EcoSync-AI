@@ -7,6 +7,8 @@ import {fileURLToPath} from 'node:url';
 import pg from 'pg';
 import Groq from 'groq-sdk';
 import {z} from 'zod';
+import {randomUUID} from 'node:crypto';
+import {AsyncLocalStorage} from 'node:async_hooks';
 const app=express();app.disable('x-powered-by');app.use(express.json({limit:'16kb'}));
 const origins=(process.env.FRONTEND_ORIGIN||'http://localhost:5173').split(',').map(x=>x.trim());app.use(cors({origin:origins}));
 const DATA=path.join(path.dirname(fileURLToPath(import.meta.url)),'..','data.json');
@@ -20,17 +22,92 @@ lectures:[{id:1,title:'Applied Mathematics',room_id:1,start_at:stamp(0),end_at:s
 {id:2,title:'Computer Science',room_id:2,start_at:stamp(2),end_at:stamp(4),status:'scheduled'},
 {id:3,title:'Physics Laboratory',room_id:3,start_at:stamp(1),end_at:stamp(3),status:'scheduled'},
 {id:4,title:'Data Structures',room_id:4,start_at:stamp(4),end_at:stamp(6),status:'scheduled'}],events:[{id:1,message:'Campus workspace initialized',created_at:new Date().toISOString()}]};
-const pool=process.env.DATABASE_URL?new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL.includes('localhost')?false:{rejectUnauthorized:false}}):null;
+const pool=process.env.DATABASE_URL
+ ? new pg.Pool({
+     connectionString:process.env.DATABASE_URL,
+     max:3,
+     ssl:process.env.DATABASE_URL.includes('localhost')?false:{rejectUnauthorized:false}
+   })
+ : null;
+
+const sessionStore = new AsyncLocalStorage();
+
+app.use((req,res,next)=>{
+  let sid;
+  const match=(req.headers.cookie||'').match(/(?:^|;\\s*)ecosync_sid=([a-f0-9-]{36})(?:;|$)/i);
+  if(match && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(match[1])){
+    sid=match[1];
+  } else {
+    sid=randomUUID();
+    res.cookie('ecosync_sid',sid,{
+      httpOnly:true,
+      secure:process.env.VERCEL==='1'||process.env.NODE_ENV==='production',
+      sameSite:'lax',
+      maxAge:7*24*60*60*1000,
+      path:'/'
+    });
+  }
+  sessionStore.run(sid,next);
+});
+
 let local=fs.existsSync(DATA)?JSON.parse(fs.readFileSync(DATA,'utf8')):structuredClone(seed);
-let initialized=false;
-async function getState(){
- if(!pool)return local;
- if(!initialized){await pool.query('CREATE TABLE IF NOT EXISTS ecosync_state (id INTEGER PRIMARY KEY, payload JSONB NOT NULL)');await pool.query('INSERT INTO ecosync_state(id,payload) VALUES(1,$1) ON CONFLICT DO NOTHING',[JSON.stringify(seed)]);initialized=true;}
- const {rows}=await pool.query('SELECT payload FROM ecosync_state WHERE id=1');return rows[0].payload;
+
+function sessionId(){
+  const id=sessionStore.getStore();
+  if(!id)throw Error('Missing visitor session');
+  return id;
 }
+
+async function ensureSession(client){
+  await client.query('CREATE TABLE IF NOT EXISTS ecosync_sessions (id TEXT PRIMARY KEY, payload JSONB NOT NULL)');
+  await client.query(
+    'INSERT INTO ecosync_sessions(id,payload) VALUES($1,$2::jsonb) ON CONFLICT DO NOTHING',
+    [sessionId(),JSON.stringify(seed)]
+  );
+}
+
+async function getState(){
+  if(!pool){
+    if(process.env.VERCEL)throw Error('DATABASE_URL required on Vercel');
+    return local;
+  }
+  await ensureSession(pool);
+  const {rows}=await pool.query(
+    'SELECT payload FROM ecosync_sessions WHERE id=$1',
+    [sessionId()]
+  );
+  return rows[0].payload;
+}
+
 async function mutate(fn){
- if(!pool){const value=fn(local);fs.writeFileSync(DATA,JSON.stringify(local,null,2));return value;}
- const client=await pool.connect();try{await client.query('BEGIN');await client.query('CREATE TABLE IF NOT EXISTS ecosync_state (id INTEGER PRIMARY KEY, payload JSONB NOT NULL)');await client.query('INSERT INTO ecosync_state(id,payload) VALUES(1,$1) ON CONFLICT DO NOTHING',[JSON.stringify(seed)]);const {rows}=await client.query('SELECT payload FROM ecosync_state WHERE id=1 FOR UPDATE');const state=rows[0].payload;const result=fn(state);await client.query('UPDATE ecosync_state SET payload=$1 WHERE id=1',[JSON.stringify(state)]);await client.query('COMMIT');return result;}catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
+  if(!pool){
+    if(process.env.VERCEL)throw Error('DATABASE_URL required on Vercel');
+    const value=fn(local);
+    fs.writeFileSync(DATA,JSON.stringify(local,null,2));
+    return value;
+  }
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    await ensureSession(client);
+    const {rows}=await client.query(
+      'SELECT payload FROM ecosync_sessions WHERE id=$1 FOR UPDATE',
+      [sessionId()]
+    );
+    const state=rows[0].payload;
+    const result=fn(state);
+    await client.query(
+      'UPDATE ecosync_sessions SET payload=$2::jsonb WHERE id=$1',
+      [sessionId(),JSON.stringify(state)]
+    );
+    await client.query('COMMIT');
+    return result;
+  }catch(e){
+    await client.query('ROLLBACK');
+    throw e;
+  }finally{
+    client.release();
+  }
 }
 const safe=fn=>(req,res,next)=>Promise.resolve(fn(req,res)).catch(next);
 function metric(s){const energy=l=>{const room=s.rooms.find(r=>r.id===l.room_id);return room?room.load_kw*Math.max(0,(Date.parse(l.end_at)-Date.parse(l.start_at))/3600000):0;};const baseline=s.lectures.reduce((t,l)=>t+energy(l),0),projected=s.lectures.filter(l=>l.status==='scheduled').reduce((t,l)=>t+energy(l),0);return {rooms:s.rooms.length,scheduled_lectures:s.lectures.filter(l=>l.status==='scheduled').length,cancelled_lectures:s.lectures.filter(l=>l.status==='cancelled').length,baseline_kwh:+baseline.toFixed(1),projected_kwh:+projected.toFixed(1),saved_kwh:+(baseline-projected).toFixed(1),co2_avoided_kg:+((baseline-projected)*0.5).toFixed(1)};}
@@ -71,12 +148,50 @@ function freeAssistant(message,s){
 const groq=process.env.GROQ_API_KEY?new Groq({apiKey:process.env.GROQ_API_KEY.trim()}):null;
 const aiSchema=z.object({message:z.string().trim().min(2).max(400)});
 const aiHits=new Map();
+
+async function aiQuota(){
+  if(!pool)return true;
+  const day=new Date().toISOString().slice(0,10);
+  const sid=sessionId();
+  await pool.query(`CREATE TABLE IF NOT EXISTS ecosync_ai_quota (
+    id TEXT PRIMARY KEY,
+    used INTEGER NOT NULL DEFAULT 0
+  )`);
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for(const [id,limit] of [
+      ['global:'+day,60],
+      ['visitor:'+day+':'+sid,10]
+    ]){
+      const result=await client.query(
+        `INSERT INTO ecosync_ai_quota(id,used) VALUES($1,1)
+         ON CONFLICT(id) DO UPDATE SET used=ecosync_ai_quota.used+1
+         WHERE ecosync_ai_quota.used<$2 RETURNING used`,
+        [id,limit]
+      );
+      if(!result.rowCount){
+        await client.query('ROLLBACK');
+        return false;
+      }
+    }
+    await client.query('COMMIT');
+    return true;
+  } catch(e){
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 app.post('/api/ai',safe(async(q,r)=>{
  const parsed=aiSchema.safeParse(q.body);
  if(!parsed.success)return r.status(422).json({error:'Enter a message (2–400 characters)'});
  const ip=q.ip||'unknown',now=Date.now(),hits=(aiHits.get(ip)||[]).filter(t=>now-t<60000);
  if(hits.length>=15)return r.status(429).json({error:'Please wait a minute before sending more commands'});
  hits.push(now);aiHits.set(ip,hits);
+ if(!await aiQuota())return r.status(429).json({error:'AI demo daily limit reached. Please try again tomorrow.'});
  const s=await getState();
  const deterministic=freeAssistant(parsed.data.message,s);
  const fallback=()=>r.json({...deterministic,mode:'local'});
@@ -98,4 +213,8 @@ app.post('/api/ai',safe(async(q,r)=>{
  }
 }));
 app.use((err,_req,res,_next)=>{console.error(err);res.status(err.status||500).json({error:err.status?err.message:'Request failed. Check backend logs.'});});
-const port=Number(process.env.PORT)||8000;app.listen(port,'0.0.0.0',()=>console.log('EcoSync API ready on '+port));
+export default app;
+if (!process.env.VERCEL) {
+  const port = Number(process.env.PORT) || 8000;
+  app.listen(port, '0.0.0.0', () => console.log('EcoSync API ready on ' + port));
+}

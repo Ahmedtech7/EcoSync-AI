@@ -8,5 +8,6 @@
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
-  }
+  },
+  "type": "module"
 }

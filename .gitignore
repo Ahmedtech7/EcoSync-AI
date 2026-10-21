@@ -12,3 +12,15 @@ dist/
 *.log
 
 *.bak
+.vercel
+.env*
+
+# Local AI tooling
+.agents/
+.claude/
+skills-lock.json
+*.session-backup
+
+# Local credentials
+.env.local
+.env.*.local
